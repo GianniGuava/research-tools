@@ -1,0 +1,129 @@
+#!/usr/bin/env node
+// Fetch a page with a real browser and print its text (or HTML, links, screenshot).
+// Exists because curl and plain fetchers get 403s, rate limits and empty JavaScript shells.
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const HOME = os.homedir();
+const LIBS = process.env.FETCHPAGE_LIBS || path.join(HOME, '.local/chrome-libs/root');
+// Default user agent is Playwright's own (it says HeadlessChrome). The tool is for rendering
+// JavaScript pages, not for getting past bot checks, so it does not pretend to be a desktop browser.
+const UA = process.env.FETCHPAGE_UA || undefined;
+
+function usage(code) {
+  const msg = `usage: fetchpage [options] <url>
+  --html              print the final DOM as HTML instead of text
+  --links             print "text -> href" for every link instead of text
+  --screenshot FILE   save a full-page PNG
+  --wait MODE         load | domcontentloaded | networkidle (default: domcontentloaded, then a short networkidle attempt)
+  --timeout MS        navigation timeout (default 45000)
+  --selector CSS      only print text inside this element
+  --max N             truncate output to N characters (default: none)
+  --ua STRING         override the user agent (default: Playwright's HeadlessChrome string)
+Status, final URL and title go to stderr; content goes to stdout. Exit 0 on HTTP 2xx/3xx, 3 on 4xx/5xx, 2 on browser failure.`;
+  (code ? console.error : console.log)(msg);
+  process.exit(code);
+}
+
+function parseArgs(argv) {
+  const o = { wait: 'domcontentloaded', timeout: 45000 };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const next = () => { if (i + 1 >= argv.length) usage(1); return argv[++i]; };
+    if (a === '--html') o.html = true;
+    else if (a === '--links') o.links = true;
+    else if (a === '--screenshot') o.screenshot = next();
+    else if (a === '--wait') o.wait = next();
+    else if (a === '--timeout') o.timeout = parseInt(next(), 10);
+    else if (a === '--selector') o.selector = next();
+    else if (a === '--max') o.max = parseInt(next(), 10);
+    else if (a === '--ua') o.ua = next();
+    else if (a === '-h' || a === '--help') usage(0);
+    else if (a.startsWith('-')) usage(1);
+    else o.url = a;
+  }
+  if (!o.url) usage(1);
+  if (!/^https?:\/\//i.test(o.url)) o.url = 'https://' + o.url;
+  return o;
+}
+
+function findChrome() {
+  if (process.env.FETCHPAGE_CHROME) return process.env.FETCHPAGE_CHROME;
+  const root = path.join(HOME, '.cache/ms-playwright');
+  if (!fs.existsSync(root)) return undefined;
+  const dirs = fs.readdirSync(root).filter(d => d.startsWith('chromium_headless_shell-')).sort().reverse();
+  for (const d of dirs) {
+    const p = path.join(root, d, 'chrome-headless-shell-linux64', 'chrome-headless-shell');
+    if (fs.existsSync(p)) return p;
+  }
+  return undefined; // let Playwright use its own registry
+}
+
+async function main() {
+  const o = parseArgs(process.argv.slice(2));
+  if (fs.existsSync(LIBS)) {
+    const extra = [path.join(LIBS, 'usr/lib/x86_64-linux-gnu'), path.join(LIBS, 'usr/lib')].join(':');
+    process.env.LD_LIBRARY_PATH = extra + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : '');
+    // Without a fontconfig file the headless shell lays out no text (innerText is empty) and
+    // crashes on the second navigation, so point fontconfig at the staged fonts.
+    const fontDir = path.join(LIBS, 'usr/share/fonts');
+    if (fs.existsSync(fontDir) && !process.env.FONTCONFIG_FILE) {
+      const fc = path.join(os.tmpdir(), 'fetchpage-fonts.conf');
+      const cache = path.join(os.tmpdir(), 'fetchpage-fontconfig-cache');
+      fs.writeFileSync(fc, `<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n  <dir>${fontDir}</dir>\n  <cachedir>${cache}</cachedir>\n</fontconfig>\n`);
+      process.env.FONTCONFIG_FILE = fc;
+    }
+  }
+  const { chromium } = require('playwright');
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true, executablePath: findChrome(), args: ['--no-sandbox', '--disable-gpu'] });
+  } catch (e) {
+    console.error('fetchpage: browser failed to start: ' + e.message.split('\n')[0]);
+    process.exit(2);
+  }
+  let exit = 0;
+  try {
+    const ctx = await browser.newContext({ userAgent: o.ua || UA, viewport: { width: 1366, height: 900 }, locale: 'en-US' });
+    const page = await ctx.newPage();
+    let resp = null;
+    try {
+      resp = await page.goto(o.url, { waitUntil: o.wait, timeout: o.timeout });
+    } catch (e) {
+      console.error('fetchpage: navigation error: ' + e.message.split('\n')[0]);
+      process.exit(3);
+    }
+    if (o.wait === 'domcontentloaded') {
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    }
+    const status = resp ? resp.status() : 0;
+    const title = (await page.title()).trim();
+    console.error(`fetchpage: HTTP ${status} ${page.url()}`);
+    if (title) console.error(`fetchpage: title: ${title}`);
+    if (status >= 400) exit = 3;
+
+    if (o.screenshot) {
+      await page.screenshot({ path: o.screenshot, fullPage: true });
+      console.error(`fetchpage: screenshot saved to ${o.screenshot}`);
+    }
+    let out;
+    if (o.links) {
+      const links = await page.$$eval('a[href]', as => as.map(a => (a.innerText || '').trim().replace(/\s+/g, ' ') + ' -> ' + a.href));
+      out = links.join('\n');
+    } else if (o.html) {
+      out = o.selector ? await page.$eval(o.selector, el => el.outerHTML) : await page.content();
+    } else {
+      out = o.selector ? await page.$eval(o.selector, el => el.innerText || el.textContent) : await page.evaluate(() => document.body ? (document.body.innerText || document.body.textContent) : '');
+      out = out.replace(/\n{3,}/g, '\n\n').trim();
+    }
+    if (o.max && out.length > o.max) out = out.slice(0, o.max) + `\n[fetchpage: truncated at ${o.max} of ${out.length} characters]`;
+    process.stdout.write(out + '\n');
+  } finally {
+    await browser.close();
+  }
+  process.exit(exit);
+}
+
+main().catch(e => { console.error('fetchpage: ' + e.message); process.exit(2); });

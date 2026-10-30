@@ -1,0 +1,29 @@
+# LAN-only SearXNG. Everything not listed here comes from SearXNG's defaults.
+# Reference: https://docs.searxng.org/admin/settings/settings_search.html (2026.10.30)
+use_default_settings: true
+
+general:
+  instance_name: "research-tools"
+  debug: false
+  enable_metrics: true
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  # Overridden by the SEARXNG_SECRET environment variable set in docker-compose.yml.
+  secret_key: "replace-me"
+  # The limiter needs Valkey and exists to protect public instances. This one is LAN-only.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  default_lang: "en"
+  # json is off by default; without it /search?format=json returns 403.
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true

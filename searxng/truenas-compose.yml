@@ -1,0 +1,23 @@
+# Variant for TrueNAS "Apps > Discover > (three dots) > Install via YAML".
+# The UI has no .env file and needs absolute host paths. /mnt/code on the LAN is /mnt/main/code on the NAS,
+# so the repo's own searxng/config directory is the config bind mount.
+# Replace REPLACE_ME with: openssl rand -hex 32
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    volumes:
+      - /mnt/main/code/research-tools/searxng/config:/etc/searxng:rw
+      - /mnt/main/code/research-tools/searxng/data:/var/cache/searxng:rw
+    environment:
+      SEARXNG_BASE_URL: "http://10.0.0.16:8888/"
+      SEARXNG_SECRET: "REPLACE_ME"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
