@@ -28,6 +28,12 @@ websearch -s -n 5 '!pubmed myo-inositol'    # snippets; SearXNG bang syntax sele
 websearch --json query > results.json       # raw JSON, includes answers/infoboxes/suggestions
 websearch --public query                    # public instance fallback (usually fails: most disable JSON)
 
+websearch scholar inositol PCOS                        # Semantic Scholar, 15 results, relevance ranked
+websearch scholar -y 2020- --type Review,MetaAnalysis -s inositol PCOS
+websearch scholar --cited-by DOI:10.1002/jrsm.1378     # citation chaining: who cites this paper
+websearch scholar --references PMID:31614060           # what this paper cites
+websearch scholar --open-access --min-citations 50 query
+
 fetchpage https://example.com/              # page text to stdout; status, URL, title to stderr
 fetchpage --links URL                       # "text -> href" per link
 fetchpage --html --selector main URL        # HTML of one element
@@ -40,6 +46,12 @@ Exit codes for `fetchpage`: 0 on 2xx/3xx, 3 on 4xx/5xx or navigation failure, 2 
 ### What fetchpage is not for
 
 It renders JavaScript. It does not try to get past bot checks, captchas or paywalls, and its default user agent is Playwright's own, which identifies itself as HeadlessChrome. Sites that refuse automated clients (PitchBook, Forbes, OpenCorporates were the examples that prompted this tool) will still refuse it, and that refusal is the answer. In the claude-dev container the permission classifier also blocks fetches aimed at such sites. `--ua` exists for sites that legitimately need a specific string, not for impersonation.
+
+### Academic search
+
+`websearch scholar` uses the Semantic Scholar Academic Graph API (api.semanticscholar.org/graph/v1, spec read 2026-10-30). It replaces Google Scholar, which has no API and whose robots.txt disallows automated queries, so this repo does not scrape it. Paper IDs accept `DOI:`, `PMID:`, `ARXIV:`, `PMCID:` prefixes or a Semantic Scholar id. Each result prints the DOI link, up to three authors, venue, year, citation count, PubMed id and open-access PDF when present. Relevance search returns at most 1,000 results in pages of 100.
+
+The unauthenticated quota is shared by everyone and returned 429 on most calls during testing, so the client retries three times with backoff and then tells you to get a key. Apply for a free key at https://www.semanticscholar.org/product/api#api-key-form and `export S2_API_KEY=...`; the client sends it as `x-api-key`.
 
 ## Deploying SearXNG on the NAS (TrueNAS)
 

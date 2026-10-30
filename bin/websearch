@@ -3,11 +3,17 @@
 
 Standard library only. Default instance is the NAS (SEARXNG_URL or http://10.0.0.16:8888).
 --public falls back to a public instance that allows JSON output.
+
+    websearch scholar <query>          academic search via the Semantic Scholar API
+    websearch scholar --cited-by ID    papers citing ID (DOI:..., PMID:..., ARXIV:..., or an S2 id)
+    websearch scholar --references ID  papers ID cites
 """
 import argparse
+import html
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +34,111 @@ def search(base, params, timeout):
         head = body[:120].decode("utf-8", "replace").strip().replace("\n", " ")
         raise SystemExit(f"websearch: {base} did not return JSON (got: {head!r}). "
                          "Public instances usually disable the JSON API or sit behind a browser check; use the NAS instance.")
+
+S2_API = "https://api.semanticscholar.org/graph/v1"
+S2_FIELDS = "title,authors,year,publicationDate,venue,externalIds,citationCount,openAccessPdf,publicationTypes,abstract"
+
+
+def s2_get(path, params, timeout, tries=4):
+    """GET from Semantic Scholar with backoff. The unauthenticated pool is shared and often returns 429."""
+    url = S2_API + path + "?" + urllib.parse.urlencode(params)
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+    key = os.environ.get("S2_API_KEY")
+    if key:
+        headers["x-api-key"] = key
+    delay = 2
+    for attempt in range(1, tries + 1):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == tries:
+                break
+            if e.code == 429 and attempt < tries:
+                print(f"websearch: Semantic Scholar rate-limited (429), retry {attempt}/{tries - 1} in {delay}s"
+                      + ("" if key else "; set S2_API_KEY for your own quota"), file=sys.stderr)
+                time.sleep(delay)
+                delay *= 2
+                continue
+            body = e.read()[:200].decode("utf-8", "replace")
+            sys.exit(f"websearch: Semantic Scholar HTTP {e.code}: {body}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            sys.exit(f"websearch: cannot reach Semantic Scholar: {e}")
+    sys.exit("websearch: Semantic Scholar still rate-limited after retries. "
+             "Apply for a free key at https://www.semanticscholar.org/product/api#api-key-form and export S2_API_KEY.")
+
+
+def print_paper(i, r, snippets):
+    ids = r.get("externalIds") or {}
+    doi = ids.get("DOI")
+    link = f"https://doi.org/{doi}" if doi else f"https://www.semanticscholar.org/paper/{r.get('paperId', '')}"
+    authors = [a.get("name", "") for a in (r.get("authors") or [])]
+    if len(authors) > 3:
+        authors = authors[:3] + ["et al."]
+    meta = [", ".join(authors), " ".join(x for x in (html.unescape(r.get("venue") or ""), str(r.get("year") or "")) if x),
+            f"cited by {r.get('citationCount')}" if r.get("citationCount") is not None else ""]
+    pmid = ids.get("PubMed")
+    if pmid:
+        meta.append(f"PMID {pmid}")
+    oa = (r.get("openAccessPdf") or {}).get("url")
+    print(f"{i:2}. {(r.get('title') or '').strip()}")
+    print(f"    {link}")
+    print(f"    [{' | '.join(m for m in meta if m)}]")
+    if oa:
+        print(f"    open access: {oa}")
+    if snippets and r.get("abstract"):
+        print(f"    {r['abstract'].strip()[:400]}")
+
+
+def scholar(argv):
+    ap = argparse.ArgumentParser(prog="websearch scholar", description="Academic search via the Semantic Scholar Academic Graph API (api.semanticscholar.org). No key needed; S2_API_KEY raises the rate limit.")
+    ap.add_argument("query", nargs="*", help="search terms")
+    ap.add_argument("--cited-by", metavar="ID", help="list papers citing ID (DOI:10.x/y, PMID:123, ARXIV:2101.00001, or an S2 paper id)")
+    ap.add_argument("--references", metavar="ID", help="list papers that ID cites")
+    ap.add_argument("-n", type=int, default=15, help="results (default 15, max 100)")
+    ap.add_argument("-y", "--year", help="year or range, e.g. 2020, 2018-2024, 2020- (search only)")
+    ap.add_argument("--type", help="comma list: Review,JournalArticle,MetaAnalysis,ClinicalTrial,... (search only)")
+    ap.add_argument("--open-access", action="store_true", help="only papers with an open-access PDF (search only)")
+    ap.add_argument("--min-citations", type=int, help="minimum citation count (search only)")
+    ap.add_argument("-s", "--snippets", action="store_true", help="show the first 400 characters of each abstract")
+    ap.add_argument("--json", action="store_true", help="raw JSON")
+    ap.add_argument("--timeout", type=float, default=30)
+    a = ap.parse_args(argv)
+    n = max(1, min(a.n, 100))
+
+    if a.cited_by or a.references:
+        pid = a.cited_by or a.references
+        kind = "citations" if a.cited_by else "references"
+        sub = "citingPaper" if a.cited_by else "citedPaper"
+        data = s2_get(f"/paper/{urllib.parse.quote(pid, safe=':')}/{kind}", {"fields": S2_FIELDS, "limit": n}, a.timeout)
+        papers = [d[sub] for d in data.get("data", []) if d.get(sub)]
+        label = f"papers citing {pid}" if a.cited_by else f"papers cited by {pid}"
+        total = ""
+    else:
+        if not a.query:
+            ap.error("give search terms, or --cited-by ID / --references ID")
+        params = {"query": " ".join(a.query), "fields": S2_FIELDS, "limit": n}
+        if a.year:
+            params["year"] = a.year
+        if a.type:
+            params["publicationTypes"] = a.type
+        if a.open_access:
+            params["openAccessPdf"] = ""
+        if a.min_citations is not None:
+            params["minCitationCount"] = a.min_citations
+        data = s2_get("/paper/search", params, a.timeout)
+        papers = data.get("data", [])
+        label = f"{params['query']!r}"
+        total = f", {data.get('total')} total matches" if data.get("total") is not None else ""
+
+    if a.json:
+        json.dump(data, sys.stdout, indent=1, ensure_ascii=False)
+        print()
+        return
+    print(f"# Semantic Scholar: {len(papers)} results for {label}{total}")
+    for i, r in enumerate(papers, 1):
+        print_paper(i, r, a.snippets)
 
 
 def main():
@@ -85,4 +196,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "scholar":
+        scholar(sys.argv[2:])
+    else:
+        main()
