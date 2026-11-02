@@ -133,19 +133,77 @@ def ensure_server(base, deadline):
             time.sleep(0.2)
         return starting
 
-S2_API = "https://api.semanticscholar.org/graph/v1"
+S2_API = os.environ.get("S2_API_URL", "https://api.semanticscholar.org/graph/v1")
 S2_FIELDS = "title,authors,year,publicationDate,venue,externalIds,citationCount,openAccessPdf,publicationTypes,abstract"
+S2_SPACING = 1.1    # seconds between requests; the key allows 1 per second, cumulative across all endpoints
+S2_DAILY_CAP = 200  # requests per UTC day, the figure promised in the key application
+
+
+def config_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "research-tools"
+
+
+def s2_key():
+    """The key from S2_API_KEY or the private key file, trimmed; '' (after one line on stderr) when there is none."""
+    key = os.environ.get("S2_API_KEY", "").strip()
+    if key:
+        return key
+    path = config_dir() / "s2_api_key"
+    try:
+        key = path.read_text().strip()
+    except FileNotFoundError:
+        print(f"websearch: no Semantic Scholar key at {path}; searching without a key (shared, often rate-limited)",
+              file=sys.stderr)
+        return ""
+    except OSError as e:
+        print(f"websearch: cannot read {path} ({e.strerror}); searching without a key", file=sys.stderr)
+        return ""
+    return key
+
+
+def s2_slot():
+    """Wait for this request's turn, across every process on this machine.
+
+    Holds a lock on the shared state file while waiting, so requests are at least S2_SPACING apart,
+    and refuses (without sending) once S2_DAILY_CAP requests have gone out today.
+    """
+    d = state_dir()
+    path = d / "s2_requests.json"
+    with open(d / "s2_requests.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            st = json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            st = {}
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        recent = st.get("recent") or []
+        count = st.get("count", 0) if st.get("day") == today else 0
+        if count >= S2_DAILY_CAP:
+            sys.exit(f"websearch: Semantic Scholar daily cap reached ({S2_DAILY_CAP} requests today, UTC); "
+                     f"not sent. Try again tomorrow, or {FALLBACK}")
+        wait = recent[-1] + S2_SPACING - time.time() if recent else 0
+        if wait > 0:
+            time.sleep(wait)
+        st = {"day": today, "count": count + 1, "recent": (recent + [time.time()])[-20:]}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(st))
+        tmp.replace(path)
 
 
 def s2_get(path, params, timeout, tries=4):
-    """GET from Semantic Scholar with backoff. The unauthenticated pool is shared and often returns 429."""
+    """GET from Semantic Scholar: spaced and capped by s2_slot, with backoff on 429. The key never reaches output."""
     url = S2_API + path + "?" + urllib.parse.urlencode(params)
     headers = {"User-Agent": UA, "Accept": "application/json"}
-    key = os.environ.get("S2_API_KEY")
+    key = s2_key()
     if key:
         headers["x-api-key"] = key
+
+    def clean(text):
+        return text.replace(key, "[key]") if key else text
+
     delay = 2
     for attempt in range(1, tries + 1):
+        s2_slot()
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -155,16 +213,16 @@ def s2_get(path, params, timeout, tries=4):
                 break
             if e.code == 429 and attempt < tries:
                 print(f"websearch: Semantic Scholar rate-limited (429), retry {attempt}/{tries - 1} in {delay}s"
-                      + ("" if key else "; set S2_API_KEY for your own quota"), file=sys.stderr)
+                      + ("" if key else "; no key in use"), file=sys.stderr)
                 time.sleep(delay)
                 delay *= 2
                 continue
             body = e.read()[:200].decode("utf-8", "replace")
-            sys.exit(f"websearch: Semantic Scholar HTTP {e.code}: {body}")
+            sys.exit(clean(f"websearch: Semantic Scholar HTTP {e.code}: {body}"))
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            sys.exit(f"websearch: cannot reach Semantic Scholar: {e}")
-    sys.exit("websearch: Semantic Scholar still rate-limited after retries. "
-             "Apply for a free key at https://www.semanticscholar.org/product/api#api-key-form and export S2_API_KEY.")
+            sys.exit(clean(f"websearch: cannot reach Semantic Scholar: {e}"))
+    sys.exit("websearch: Semantic Scholar still rate-limited after retries"
+             + ("." if key else f"; no key found at {config_dir() / 's2_api_key'}."))
 
 
 def print_paper(i, r, snippets):
@@ -190,7 +248,7 @@ def print_paper(i, r, snippets):
 
 
 def scholar(argv):
-    ap = argparse.ArgumentParser(prog="websearch scholar", description="Academic search via the Semantic Scholar Academic Graph API (api.semanticscholar.org). No key needed; S2_API_KEY raises the rate limit.")
+    ap = argparse.ArgumentParser(prog="websearch scholar", description="Academic search via the Semantic Scholar Academic Graph API (api.semanticscholar.org). Uses the key in ~/.config/research-tools/ when present; requests are spaced 1.1 s apart and capped at 200 a day.")
     ap.add_argument("query", nargs="*", help="search terms")
     ap.add_argument("--cited-by", metavar="ID", help="list papers citing ID (DOI:10.x/y, PMID:123, ARXIV:2101.00001, or an S2 paper id)")
     ap.add_argument("--references", metavar="ID", help="list papers that ID cites")

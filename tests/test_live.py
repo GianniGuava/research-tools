@@ -82,5 +82,38 @@ class Check4StartsByItself(unittest.TestCase):
         self.assertEqual(names, ["searxng"])
 
 
+@live
+class Check5Scholar(unittest.TestCase):
+    """Done check 5 with the real key: 10 searches in a row, no rate-limit refusals, spaced 1.1 s or more.
+
+    Uses 12 of the day's 200 requests. The key is compared inside the test and never printed.
+    """
+
+    def test_ten_searches_in_a_row(self):
+        key = (Path.home() / ".config" / "research-tools" / "s2_api_key").read_text().strip()
+        queries = ["rank biased overlap", "metasearch engine evaluation", "search result overlap",
+                   "web search engine comparison", "query log analysis", "information retrieval evaluation",
+                   "learning to rank", "search engine bias", "federated search", "result merging"]
+        outputs = [run("scholar", "-n", "3", q) for q in queries]
+        for q, p in zip(queries, outputs):
+            self.assertEqual(p.returncode, 0, f"{q}: {p.stderr.replace(key, '[key]')}")
+            self.assertNotIn("429", p.stderr)
+            self.assertNotIn("without a key", p.stderr)
+            self.assertFalse(key in p.stdout or key in p.stderr, "the key appeared in the output")
+        state = json.loads((Path.home() / ".local" / "state" / "research-tools" / "s2_requests.json").read_text())
+        times = state["recent"][-10:]
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        print(f"\n  check 5: 10 searches ok; smallest gap {min(gaps):.2f}s; {state['count']} requests today",
+              file=sys.stderr)
+        self.assertTrue(all(g >= 1.1 for g in gaps), gaps)
+
+    def test_cited_by_and_references_still_work(self):
+        doi = "DOI:10.1145/1852102.1852106"  # Webber, Moffat and Zobel, rank-biased overlap
+        for flag in ("--cited-by", "--references"):
+            p = run("scholar", flag, doi, "-n", "3")
+            self.assertEqual(p.returncode, 0, p.stderr[:300])
+            self.assertIn(" 1. ", p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
