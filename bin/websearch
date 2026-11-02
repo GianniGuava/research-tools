@@ -49,6 +49,12 @@ def search(base, params, timeout):
                          "Public instances usually disable the JSON API or sit behind a browser check; use the local instance.")
 
 
+def failed_engines(data):
+    """One line naming each engine that failed or blocked the server, with SearXNG's reason; '' when none did."""
+    bad = [f"{e[0]} ({e[1]})" if len(e) > 1 and e[1] else str(e[0]) for e in data.get("unresponsive_engines") or []]
+    return f"failed engines, results may be missing: {', '.join(bad)}" if bad else ""
+
+
 def state_dir():
     d = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "research-tools"
     d.mkdir(parents=True, exist_ok=True)
@@ -326,16 +332,18 @@ def main():
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         sys.exit(f"websearch: cannot reach {base}: {e}; {FALLBACK}")
 
+    failed = failed_engines(data)
     if a.json:
         json.dump(data, sys.stdout, indent=1, ensure_ascii=False)
         print()
+        if failed:
+            print(f"# {failed}", file=sys.stderr)
         return
 
     results = data.get("results", [])
     print(f"# {len(results)} results from {base} for {params['q']!r} (page {a.page}, {a.category})")
-    if data.get("unresponsive_engines"):
-        bad = ", ".join(f"{e[0]} ({e[1]})" for e in data["unresponsive_engines"])
-        print(f"# unresponsive engines: {bad}")
+    if failed:
+        print(f"# {failed}")
     for i, r in enumerate(results[: a.n], 1):
         engines = ",".join(r.get("engines") or [])
         date = (r.get("publishedDate") or "")[:10]
