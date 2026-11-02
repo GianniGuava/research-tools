@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
 """Query a SearXNG instance and print the raw ranked results.
 
-Standard library only. Default instance is the NAS (SEARXNG_URL or http://10.0.0.16:8888).
+Standard library only. Default instance is the container on this machine (SEARXNG_URL or
+http://127.0.0.1:8888); if it is not answering, the tool starts it (waiting at most 5 seconds).
 --public falls back to a public instance that allows JSON output.
+
+    websearch server status|start|stop|update   manage the local SearXNG container
 
     websearch scholar <query>          academic search via the Semantic Scholar API
     websearch scholar --cited-by ID    papers citing ID (DOI:..., PMID:..., ARXIV:..., or an S2 id)
     websearch scholar --references ID  papers ID cites
 """
 import argparse
+import fcntl
+import grp
 import html
 import json
 import os
+import shlex
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
-DEFAULT_URL = os.environ.get("SEARXNG_URL", "http://10.0.0.16:8888")
+T0 = time.monotonic()
+REPO = Path(__file__).resolve().parent.parent
+COMPOSE_FILE = REPO / "searxng" / "docker-compose.yml"
+DEFAULT_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888")
+FALLBACK = "use the built-in web search for now"
+START_WAIT = 4.5  # seconds from launch; done check 3 allows 5 in total
 PUBLIC_URL = os.environ.get("SEARXNG_PUBLIC_URL", "https://searx.be")
 UA = "Mozilla/5.0 (X11; Linux x86_64) research-tools/websearch"
 
@@ -33,7 +46,86 @@ def search(base, params, timeout):
     except json.JSONDecodeError:
         head = body[:120].decode("utf-8", "replace").strip().replace("\n", " ")
         raise SystemExit(f"websearch: {base} did not return JSON (got: {head!r}). "
-                         "Public instances usually disable the JSON API or sit behind a browser check; use the NAS instance.")
+                         "Public instances usually disable the JSON API or sit behind a browser check; use the local instance.")
+
+
+def state_dir():
+    d = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "research-tools"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def is_local(base):
+    return urllib.parse.urlparse(base).hostname in ("127.0.0.1", "localhost", "::1")
+
+
+def healthy(base, timeout=1.0):
+    try:
+        with urllib.request.urlopen(base.rstrip("/") + "/healthz", timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def docker_cmd(args):
+    """A docker command line, run through `sg docker` when this process started before the account joined the group."""
+    try:
+        gid = grp.getgrnam("docker").gr_gid
+    except KeyError:
+        return ["docker", *args]
+    if os.geteuid() == 0 or gid in os.getgroups():
+        return ["docker", *args]
+    return ["sg", "docker", "-c", shlex.join(["docker", *args])]
+
+
+def start_command():
+    override = os.environ.get("WEBSEARCH_START_CMD")  # used by the tests
+    return shlex.split(override) if override else docker_cmd(["compose", "-f", str(COMPOSE_FILE), "up", "-d"])
+
+
+def last_line(path):
+    try:
+        lines = [l.strip() for l in Path(path).read_text(errors="replace").splitlines() if l.strip()]
+    except OSError:
+        return "no output"
+    return lines[-1][:200] if lines else "no output"
+
+
+def ensure_server(base, deadline):
+    """Start the local server if it is not answering. Returns None once it answers, else a one-line reason.
+
+    A lock keeps two sessions from starting it at once. The start command keeps running after this
+    returns, so a server that is still starting is ready for the next search.
+    """
+    lock_path = state_dir() / "searxng-start.lock"
+    log_path = state_dir() / "searxng-start.log"
+    starting = f"SearXNG is starting, not ready yet; {FALLBACK}"
+    with open(lock_path, "a") as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return starting
+                time.sleep(0.1)
+        if healthy(base):
+            return None
+        with open(log_path, "w") as log:
+            try:
+                proc = subprocess.Popen(start_command(), stdin=subprocess.DEVNULL, stdout=log,
+                                        stderr=subprocess.STDOUT, start_new_session=True)
+            except OSError as e:
+                return f"SearXNG is down and could not be started ({e}); {FALLBACK}"
+        while time.monotonic() < deadline:
+            if healthy(base, timeout=0.5):
+                return None
+            rc = proc.poll()
+            if rc is not None and rc != 0:
+                return (f"SearXNG is down and could not be started ({last_line(log_path)}); {FALLBACK}. "
+                        f"Details: {log_path} and `docker logs searxng`")
+            time.sleep(0.2)
+        return starting
 
 S2_API = "https://api.semanticscholar.org/graph/v1"
 S2_FIELDS = "title,authors,year,publicationDate,venue,externalIds,citationCount,openAccessPdf,publicationTypes,abstract"
@@ -141,6 +233,66 @@ def scholar(argv):
         print_paper(i, r, a.snippets)
 
 
+HUB_TAGS = "https://hub.docker.com/v2/repositories/searxng/searxng/tags?page_size=10&ordering=last_updated"
+
+
+def docker(args, **kw):
+    return subprocess.run(docker_cmd(args), capture_output=True, text=True, **kw)
+
+
+def compose(args, **kw):
+    return docker(["compose", "-f", str(COMPOSE_FILE), *args], **kw)
+
+
+def pinned_image():
+    for line in COMPOSE_FILE.read_text().splitlines():
+        if line.strip().startswith("image:"):
+            return line.split("image:", 1)[1].strip()
+    return None
+
+
+def server(argv):
+    ap = argparse.ArgumentParser(prog="websearch server", description="Manage the local SearXNG container.")
+    ap.add_argument("action", choices=["status", "start", "stop", "update"])
+    a = ap.parse_args(argv)
+    base = DEFAULT_URL
+
+    if a.action == "status":
+        r = docker(["inspect", "-f", "{{.State.Status}}", "searxng"])
+        state = r.stdout.strip() if r.returncode == 0 else f"no container ({(r.stderr.strip() or 'docker failed')[:200]})"
+        print(f"container: {state}")
+        print(f"answering at {base}: {'yes' if healthy(base) else 'no'}")
+        print(f"pinned image: {pinned_image()}")
+    elif a.action == "start":
+        problem = ensure_server(base, time.monotonic() + 120)
+        if problem:
+            sys.exit(f"websearch: {problem}")
+        print(f"SearXNG is answering at {base}")
+    elif a.action == "stop":
+        r = compose(["stop"])
+        if r.returncode != 0:
+            sys.exit(f"websearch: stop failed: {r.stderr.strip()[-300:]}")
+        print("SearXNG stopped. The next search starts it again.")
+    elif a.action == "update":
+        req = urllib.request.Request(HUB_TAGS, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            tags = json.load(resp)["results"]
+        newest = next((t for t in tags if t["name"] != "latest" and t.get("digest")), None)
+        if not newest:
+            sys.exit("websearch: Docker Hub listed no usable SearXNG tag")
+        old, new = pinned_image(), f"docker.io/searxng/searxng:{newest['name']}@{newest['digest']}"
+        if old == new:
+            print(f"Already on the newest image: {new}")
+            return
+        COMPOSE_FILE.write_text(COMPOSE_FILE.read_text().replace(old, new))
+        for step in (["pull"], ["up", "-d"]):
+            r = compose(step)
+            if r.returncode != 0:
+                COMPOSE_FILE.write_text(COMPOSE_FILE.read_text().replace(new, old))
+                sys.exit(f"websearch: compose {step[0]} failed, pin restored: {r.stderr.strip()[-300:]}")
+        print(f"image: {old}\n    -> {new}\nCommit searxng/docker-compose.yml to record the new pin.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("query", nargs="+", help="search terms (SearXNG syntax, e.g. !pubmed or site:example.com)")
@@ -162,13 +314,17 @@ def main():
     if a.time_range:
         params["time_range"] = a.time_range
 
+    if not a.public and is_local(base) and not healthy(base):
+        problem = ensure_server(base, T0 + START_WAIT)
+        if problem:
+            sys.exit(f"websearch: {problem}")
     try:
         data, url = search(base, params, a.timeout)
     except urllib.error.HTTPError as e:
         hint = " (json format not enabled on this instance?)" if e.code == 403 else ""
-        sys.exit(f"websearch: HTTP {e.code} from {base}{hint}")
+        sys.exit(f"websearch: HTTP {e.code} from {base}{hint}; {FALLBACK}")
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        sys.exit(f"websearch: cannot reach {base}: {e}")
+        sys.exit(f"websearch: cannot reach {base}: {e}; {FALLBACK}")
 
     if a.json:
         json.dump(data, sys.stdout, indent=1, ensure_ascii=False)
@@ -198,5 +354,7 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "scholar":
         scholar(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "server":
+        server(sys.argv[2:])
     else:
         main()
