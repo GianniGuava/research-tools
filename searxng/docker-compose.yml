@@ -1,18 +1,22 @@
-# SearXNG for the LAN. Deploy on the NAS (10.0.0.16); query from any machine on 10.0.0.0/24.
-# Image and volume paths follow https://docs.searxng.org/admin/installation-docker.html (2026.10.30).
+# SearXNG on claude-dev, reachable from this machine only (127.0.0.1:8888).
+# Image and volume paths follow https://docs.searxng.org/admin/installation-docker.html (read 2026-11-02).
+# Start: docker compose -f searxng/docker-compose.yml up -d   (or: websearch server start)
+# The secret lives in ~/.config/research-tools/searxng.env (mode 600), made once at install.
+# The image is pinned to the build of SearXNG commit cccbc9e15 (2026-11-02); `websearch server update` moves it.
 services:
   searxng:
-    image: docker.io/searxng/searxng:latest
+    image: docker.io/searxng/searxng:2026.11.2-cccbc9e15@sha256:892ed5710603e38f9dc201e6a0b2f3f14dbdb8108edcadac30e55b165c979fb7
     container_name: searxng
     restart: unless-stopped
     ports:
-      - "8888:8080"
+      - "127.0.0.1:8888:8080"
     volumes:
       - ./config:/etc/searxng:rw
-      - ./data:/var/cache/searxng:rw
+      - ${HOME}/.local/share/research-tools/searxng-data:/var/cache/searxng:rw
+    env_file:
+      - ${HOME}/.config/research-tools/searxng.env
     environment:
-      - SEARXNG_BASE_URL=http://10.0.0.16:8888/
-      - SEARXNG_SECRET=${SEARXNG_SECRET:?set SEARXNG_SECRET in searxng/.env (openssl rand -hex 32)}
+      - SEARXNG_BASE_URL=http://127.0.0.1:8888/
     cap_drop:
       - ALL
     cap_add:
