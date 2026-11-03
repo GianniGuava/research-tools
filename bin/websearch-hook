@@ -53,22 +53,33 @@ def short(text, n):
     return text if len(text) <= n else text[: n - 3] + "..."
 
 
+def flat(text):
+    """Web text on one line, so a title cannot add lines or sections to the file Claude is pointed at."""
+    return " ".join(str(text).split())
+
+
+def failed_names(engines):
+    return [f"{e[0]} ({e[1]})" if len(e) > 1 else str(e[0]) for e in engines if e]
+
+
 def write_search_file(path, entry):
-    q, s, c = entry["query"], entry["searxng"], entry["compare"]
+    q, s, c = flat(entry["query"]), entry["searxng"], entry["compare"]
     out = [f"# SearXNG second search: {q}", "",
            f"{entry['ts']}, session {entry['session_id']}. Built-in search: {len(entry['builtin']['results'])} links.", ""]
     if not s["ok"]:
         out += [f"SearXNG was unavailable: {s['reason']}"]
+    elif not c:
+        out += [f"SearXNG answered, but comparing failed: {entry['error']}"]
     else:
         out += [f"SearXNG: {len(s['results'])} links in {s['duration_s']}s."
-                + (f" Failed engines: {', '.join(f'{e[0]} ({e[1]})' for e in s['failed_engines'])}." if s["failed_engines"] else ""),
+                + (f" Failed engines: {flat(', '.join(failed_names(s['failed_engines'])))}." if s["failed_engines"] else ""),
                 f"In both: {c['n_both']}, only built-in: {c['n_only_builtin']}, only SearXNG: {c['n_only_searxng']}; "
                 f"agreement {ws.fmt(c['overlap_at_depth'])}, RBO {ws.fmt(c['rbo'])}.", "", "## SearXNG results", ""]
         shared = {ws.norm_url(u) for u in c["both"]}
         for i, r in enumerate(s["results"], 1):
             mark = " (also in built-in)" if ws.norm_url(r["url"]) in shared else ""
-            out += [f"{i}. {r['title']}{mark}", f"   {r['url']}", f"   [{', '.join(r['engines'])}]"]
-        out += ["", "## Only in the built-in search", ""] + [f"- {u}" for u in c["only_builtin"]]
+            out += [f"{i}. {flat(r['title'])}{mark}", f"   {flat(r['url'])}", f"   [{flat(', '.join(r['engines']))}]"]
+        out += ["", "## Only in the built-in search", ""] + [f"- {flat(u)}" for u in c["only_builtin"]]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(out) + "\n")
 
@@ -95,22 +106,29 @@ def main():
     try:
         reply = ws.searx_search(ws.DEFAULT_URL, {"q": query, "format": "json", "categories": "general",
                                                  "language": "en"}, timeout=30, deadline=started + SEARX_WAIT)
-        results = [{"title": r.get("title", ""), "url": r.get("url", ""), "engines": r.get("engines") or []}
-                   for r in reply.get("results", []) if r.get("url")]
+        results = [{"title": r.get("title") or "", "url": r["url"], "engines": r.get("engines") or []}
+                   for r in reply.get("results") or [] if isinstance(r, dict) and r.get("url")]
         searx["n_before_domain_limit"] = len(results)
         if allowed:
             results = [r for r in results if in_domains(r["url"], allowed)]
         if blocked:
             results = [r for r in results if not in_domains(r["url"], blocked)]
-        searx.update(ok=True, results=results, failed_engines=reply.get("unresponsive_engines") or [])
+        searx.update(ok=True, results=results, failed_engines=reply.get("unresponsive_engines") or [],
+                     # no results at all: engines blocked or failed, so this line says nothing about agreement
+                     degraded=searx["n_before_domain_limit"] == 0)
     except ws.Unavailable as e:
         searx["reason"] = str(e)
     searx["duration_s"] = round(time.monotonic() - started, 2)
 
-    comp = None
+    comp, error = None, None
     if searx["ok"]:
-        c = ws.compare_lists([l["url"] for l in links], [r["url"] for r in searx["results"]])
+        try:
+            c = ws.compare_lists([l["url"] for l in links], [r["url"] for r in searx["results"]])
+        except Exception as e:  # never lose the line: log it with the error instead
+            c, error = None, f"{type(e).__name__}: {e}"
+    if searx["ok"] and c:
         comp = {"n_both": len(c["both"]), "n_only_builtin": len(c["only_a"]), "n_only_searxng": len(c["only_b"]),
+                "n_builtin": c["n_a"], "n_searxng": c["n_b"],
                 "overlap": c["overlap"], "overlap_at_depth": c["overlap_at_depth"], "top10_shared": c["top10_shared"],
                 "rbo": c["rbo"], "rbo_p": c["rbo_p"],
                 "both": c["both"], "only_builtin": c["only_a"], "only_searxng": c["only_b"]}
@@ -123,21 +141,23 @@ def main():
                     "duration_s": resp.get("durationSeconds") if isinstance(resp, dict) else None,
                     "duration_ms_hook": data.get("duration_ms"),
                     "response_keys": sorted(resp) if isinstance(resp, dict) else type(resp).__name__},
-        "searxng": searx, "compare": comp, "file": str(search_file),
+        "searxng": searx, "compare": comp, "error": error, "file": str(search_file),
     }
-    write_search_file(search_file, entry)
     log = ws.EXPERIMENT_DIR / "log.jsonl"
-    with open(log, "a") as f:
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a") as f:  # the log line first, so a problem writing the search file loses nothing
         fcntl.flock(f, fcntl.LOCK_EX)
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    write_search_file(search_file, entry)
 
     q = short(query, 40)
     if comp:
-        fails = ", ".join(e[0] for e in searx["failed_engines"][:3])
+        fails = ", ".join(str(e[0]) for e in searx["failed_engines"][:3] if e)
         note = (f"SearXNG second search for '{q}': {comp['n_only_searxng']} links the built-in search did not return, "
                 f"{comp['n_both']} shared" + (f"; failed: {short(fails, 40)}" if fails else "") + f". List: {search_file}")
     else:
-        note = f"SearXNG second search for '{q}' unavailable ({short(searx['reason'], 60)}); logged. {search_file}"
+        why = searx["reason"] or f"comparison failed: {error}"
+        note = f"SearXNG second search for '{q}' unavailable ({short(why, 60)}); logged. {search_file}"
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": note}}))
 
 

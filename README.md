@@ -55,7 +55,9 @@ fetchpage --wait networkidle --timeout 60000 URL
 
 Exit codes for `fetchpage`: 0 on 2xx/3xx, 3 on 4xx/5xx or navigation failure, 2 if the browser cannot start.
 
-When SearXNG cannot answer, `websearch` prints one line within 5 seconds that ends "use the built-in web search for now", and exits non-zero.
+When SearXNG cannot answer, `websearch` prints one line within 5 seconds that says why and names the built-in web search as the fallback, and exits non-zero.
+
+`scholar`, `compare`, `server` and `experiment` are commands only when what follows fits them (a file for `compare`, an action for `server` and `experiment`), so `websearch compare postgres vs mysql` is an ordinary search. `websearch -- <query>` always searches.
 
 ### What fetchpage is not for
 
@@ -82,21 +84,23 @@ Started 2026-11-03 and runs until it is stopped: "Maybe we find out that the sea
 - For each built-in search it runs the same query on SearXNG (applying the same `allowed_domains` and `blocked_domains`), then appends one JSON line to `experiment/log.jsonl` with both full lists, both timings, failed engines and the comparison numbers. If SearXNG is unavailable the line is still written, marked so.
 - It writes SearXNG's full list to `experiment/searches/<date>-<time>-<id>.md` and gives the session a one-line note naming that file, so Claude can open it when the extra links matter.
 - `experiment/` is not committed: research queries can be private.
-- `websearch experiment off` pauses it (a one-word file, `~/.config/research-tools/experiment`; no file means on).
+- `websearch experiment off` pauses it (a one-word file, `~/.config/research-tools/experiment`; no file means on; off, false, 0, no and disabled all mean off).
+- Privacy: while it runs, every built-in query from every session also goes to the engines SearXNG uses (Bing, Brave, DuckDuckGo, Google and others) and is written to `experiment/log.jsonl` on the NAS.
 
 How the lists are compared (`websearch compare` and the hook use the same code):
 
 - Links are tidied first, so trivial differences do not count: http or https, a leading `www.`, host case, default ports, a trailing slash, the part after `#`, percent-encoding, parameter order, and tracking parameters (`utm_*`, `gclid`, `fbclid`, `srsltid` and similar). Different pages on the same site stay different.
 - Counts: in both, only in each.
 - Overlap: shared links over all distinct links (0 to 1).
-- Agreement at depth k: the share of the built-in list's k links that also appear in SearXNG's top k. The report's buckets use this: identical (1), mostly the same (0.5 or more), mostly different (above 0), nothing shared (0).
+- Agreement at depth k: the share of the built-in list's k links that also appear in SearXNG's top k. The report's buckets use this: identical (1), mostly the same (0.5 or more), mostly different (below 0.5 with at least one link in common anywhere), nothing shared (no link in common anywhere).
+- A search where SearXNG returned no results at all (every engine blocked or failed) is logged as `degraded` and, like an unavailable SearXNG, left out of the report's numbers and counted separately, so blocking cannot pass for disagreement.
 - Rank-biased overlap (RBO), extrapolated form for lists of different lengths, with p = 0.9, which gives the top 10 ranks 86% of the weight. From W. Webber, A. Moffat and J. Zobel, "A Similarity Measure for Indefinite Rankings", ACM Transactions on Information Systems 28(4), November 2010 (equation 32; agreement is equation 3; p = 0.9 is the value the paper uses to compare search engines). Author's copy: http://codalism.com/research/papers/wmz10_tois.pdf
 
 ### Academic search
 
 `websearch scholar` uses the Semantic Scholar Academic Graph API (api.semanticscholar.org/graph/v1, spec read 2026-10-30). It replaces Google Scholar, which has no API and whose robots.txt disallows automated queries, so this repo does not scrape it. Paper IDs accept `DOI:`, `PMID:`, `ARXIV:`, `PMCID:` prefixes or a Semantic Scholar id. Each result prints the DOI link, up to three authors, venue, year, citation count, PubMed id and open-access PDF when present. Relevance search returns at most 1,000 results in pages of 100.
 
-- The key is read from `~/.config/research-tools/s2_api_key` (or `S2_API_KEY`), trimmed, and sent as `x-api-key`. It never appears in output, including error messages. Without it the tool says so in one line and searches without a key.
+- The key is read from `~/.config/research-tools/s2_api_key` (or `S2_API_KEY`), trimmed, and sent as `x-api-key`. It never appears in output, including error messages; a key file holding spaces or a second line is not used (one line says so), because the HTTP library's error for such a header would quote it. Without a key the tool says so in one line and searches without one.
 - The key's terms allow 1 request per second, cumulative across all endpoints. The tool keeps every request at least 1.1 s after the previous one, across all sessions on the machine (a locked state file in `~/.local/state/research-tools/`), and stops at 200 requests per UTC day, the figure promised in the key application. Retries count toward both.
 - Semantic Scholar refuses many requests (HTTP 429) whatever the spacing: on 2026-11-02 and 03, about half to seven in ten keyed requests, and nine in ten without a key. The tool retries up to 5 times after 2, 4, 8, 16 and 16 s plus a random extra, and prints one summary line. Some searches still fail; treat it as a tool for deliberate academic lookups, with SearXNG's `-c science` (Semantic Scholar, Europe PMC, arXiv, PubMed and others) as the first stop. Leave out `-t` there: engines that cannot filter by date drop out, and on 2026-11-03 a dated science search returned nothing.
 - Terms: never share the key; credit "Semantic Scholar" in published material that uses its data; some data is CC BY-NC; keys unused for about 60 days may be removed.

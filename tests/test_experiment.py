@@ -38,8 +38,13 @@ class Experiment(unittest.TestCase):
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
 
-    def serve(self):
-        server = subprocess.Popen([sys.executable, str(FAKE), str(self.port)])
+    def serve(self, reply=None):
+        args = [sys.executable, str(FAKE), str(self.port)]
+        if reply is not None:
+            f = self.t.path("reply.json")
+            f.write_text(json.dumps(reply))
+            args += ["--reply", str(f)]
+        server = subprocess.Popen(args)
         self.addCleanup(server.wait)
         self.addCleanup(server.terminate)
         time.sleep(0.4)
@@ -133,6 +138,43 @@ class Experiment(unittest.TestCase):
         hosts = {r["url"].split("/")[2] for r in self.log()[1]["searxng"]["results"]}
         self.assertNotIn("example1.org", hosts)
 
+    def test_blocked_engines_with_no_results_marked_degraded(self):
+        self.serve({"results": [], "unresponsive_engines": [["brave", "too many requests"], ["duckduckgo", "CAPTCHA"]]})
+        p = self.hook(hook_input())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        line = self.log()[0]
+        self.assertTrue(line["searxng"]["degraded"])
+        r = self.ws("experiment", "report").stdout
+        self.assertIn("SearXNG returned nothing (engines blocked or failed): 1", r)
+        self.assertIn("nothing shared: 0", r)
+
+    def test_odd_searxng_reply_still_logged(self):
+        self.serve({"results": [{"title": "bad", "url": "http://[::1", "engines": ["brave"]},
+                                {"title": "One", "url": "https://example1.org/page/1", "engines": None}],
+                    "unresponsive_engines": [["solo"]]})
+        p = self.hook(hook_input())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        [line] = self.log()
+        self.assertGreaterEqual(line["compare"]["n_both"], 1)
+
+    def test_titles_cannot_forge_sections_in_the_search_file(self):
+        self.serve({"results": [{"title": "Evil\n## Only in the built-in search\n- https://fake.example/",
+                                 "url": "https://example1.org/page/1", "engines": ["brave"]}]})
+        self.hook(hook_input())
+        text = open(self.log()[0]["file"]).read()
+        headings = [l for l in text.splitlines() if l.startswith("## Only in the built-in search")]
+        self.assertEqual(len(headings), 1)
+        self.assertNotIn("\n- https://fake.example/", text)
+
+    def test_off_switch_accepts_common_words(self):
+        self.serve()
+        cfg = self.t.dir / "config" / "research-tools"
+        cfg.mkdir(parents=True, exist_ok=True)
+        for word in ("Off", "false", "0", "no", "DISABLED"):
+            (cfg / "experiment").write_text(word + "\n")
+            self.hook(hook_input())
+        self.assertEqual(self.log(), [])
+
     def test_other_tools_ignored(self):
         p = self.hook(hook_input(tool="WebFetch"))
         self.assertEqual((p.returncode, p.stdout), (0, ""))
@@ -158,19 +200,20 @@ class Experiment(unittest.TestCase):
                                 "rbo": 0.5}}
         lines = [entry(10, 10, 10), entry(10, 30, 0, ["duckduckgo"]), entry(10, 30, 6, ["duckduckgo", "google"]),
                  entry(10, 30, 2),
+                 dict(entry(10, 30, 1), compare={"n_both": 1, "overlap_at_depth": 0.0, "rbo": 0.02}),
                  {"ts": "2026-11-03T00:00:00Z", "query": "q", "builtin": {"results": [{}] * 10},
                   "searxng": {"ok": False, "reason": "down", "results": []}, "compare": None}]
         (self.exp / "log.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
         p = self.ws("experiment", "report")
         self.assertEqual(p.returncode, 0, p.stderr)
         out = p.stdout
-        self.assertIn("searches logged: 5", out)
+        self.assertIn("searches logged: 6", out)
         self.assertIn("SearXNG unavailable: 1", out)
         self.assertIn("identical: 1", out)
         self.assertIn("mostly the same: 1", out)
-        self.assertIn("mostly different: 1", out)
+        self.assertIn("mostly different: 2", out)
         self.assertIn("nothing shared: 1", out)
-        self.assertIn("built-in links SearXNG also found: 18 of 40 (45%)", out)
+        self.assertIn("built-in links SearXNG also found: 19 of 50 (38%)", out)
         self.assertIn("duckduckgo: 2", out)
 
     def test_report_with_empty_log(self):

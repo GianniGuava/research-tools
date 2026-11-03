@@ -1,7 +1,9 @@
 """Shared helpers for the automated tests (standard library only)."""
+import atexit
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -51,6 +53,7 @@ class TempState:
 
     def __init__(self):
         self.dir = Path(tempfile.mkdtemp(prefix="rt-test-"))
+        atexit.register(shutil.rmtree, self.dir, ignore_errors=True)
         self.env = dict(os.environ, XDG_STATE_HOME=str(self.dir / "state"), XDG_CONFIG_HOME=str(self.dir / "config"))
         self.env.pop("SEARXNG_URL", None)
         self.env.pop("S2_API_KEY", None)

@@ -127,7 +127,7 @@ def ensure_server(base, deadline):
     """
     lock_path = state_dir() / "searxng-start.lock"
     log_path = state_dir() / "searxng-start.log"
-    starting = f"SearXNG is starting, not ready yet; {FALLBACK}"
+    starting = f"SearXNG is starting, not ready yet; {FALLBACK} (if this repeats: docker logs searxng)"
     with open(lock_path, "a") as lock:
         while True:
             try:
@@ -173,6 +173,10 @@ def s2_key():
     path = config_dir() / "s2_api_key"
     try:
         key = path.read_text().strip()
+        if any(c.isspace() or not c.isprintable() for c in key):
+            print(f"websearch: the key in {path} holds spaces or more than one line, so it is not used; "
+                  "searching without a key", file=sys.stderr)
+            return ""
     except FileNotFoundError:
         print(f"websearch: no Semantic Scholar key at {path}; searching without a key (shared, often rate-limited)",
               file=sys.stderr)
@@ -203,7 +207,7 @@ def s2_slot():
         if count >= S2_DAILY_CAP:
             sys.exit(f"websearch: Semantic Scholar daily cap reached ({S2_DAILY_CAP} requests today, UTC); "
                      f"not sent. Try again tomorrow, or {FALLBACK}")
-        wait = recent[-1] + S2_SPACING - time.time() if recent else 0
+        wait = min(recent[-1] + S2_SPACING - time.time(), S2_SPACING) if recent else 0  # a clock step cannot stall
         if wait > 0:
             time.sleep(wait)
         st = {"day": today, "count": count + 1, "recent": (recent + [time.time()])[-20:]}
@@ -252,6 +256,8 @@ def s2_get(path, params, timeout, retries=5):
             time.sleep(wait + random.uniform(0, wait / 2))
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             sys.exit(clean(f"websearch: cannot reach Semantic Scholar: {e}"))
+        except ValueError:  # e.g. a header value the HTTP library refuses; its message would quote the key
+            sys.exit("websearch: the Semantic Scholar request could not be built (check the key file)")
     sys.exit(f"websearch: Semantic Scholar refused all {refused} tries (429) over {time.monotonic() - started:.0f}s"
              + ("" if key else f"; no key found at {config_dir() / 's2_api_key'}") + f"; {FALLBACK}")
 
@@ -340,8 +346,11 @@ def norm_url(url):
     url = url.strip()
     if "://" not in url:
         url = "http://" + url
-    p = urllib.parse.urlsplit(url)
-    host = (p.hostname or "").lower()
+    try:
+        p = urllib.parse.urlsplit(url)
+        host = (p.hostname or "").lower()
+    except ValueError:  # malformed, e.g. "http://[::1": compare it as written
+        return url.lower()
     if host.startswith("www."):
         host = host[4:]
     try:
@@ -401,7 +410,7 @@ def compare_lists(a, b):
     sa, sb = set(ka), set(kb)
     union = sa | sb
     return {
-        "n_a": len(ka), "n_b": len(kb),
+        "n_a": len(ka), "n_b": len(kb),  # after tidying and removing repeats
         "both": [fa[k] for k in ka if k in sb],
         "only_a": [fa[k] for k in ka if k not in sb],
         "only_b": [fb[k] for k in kb if k not in sa],
@@ -476,9 +485,10 @@ OUTBOX = Path("/mnt/code/_share/outbox/research-tools")
 def experiment_on():
     """The switch lives in ~/.config/research-tools/experiment; no file means on (installing the hook opts in)."""
     try:
-        return (config_dir() / "experiment").read_text().strip() != "off"
+        word = (config_dir() / "experiment").read_text().strip().lower()
     except FileNotFoundError:
         return True
+    return word not in ("off", "false", "0", "no", "disabled")
 
 
 def median(xs):
@@ -499,13 +509,18 @@ def experiment_report():
                 lines.append(json.loads(raw))
             except ValueError:
                 pass
-    ok = [l for l in lines if l.get("searxng", {}).get("ok") and l.get("compare")]
-    agree = [l["compare"]["overlap_at_depth"] for l in ok if l["compare"].get("overlap_at_depth") is not None]
-    buckets = {"identical": sum(a == 1 for a in agree), "mostly the same": sum(0.5 <= a < 1 for a in agree),
-               "mostly different": sum(0 < a < 0.5 for a in agree), "nothing shared": sum(a == 0 for a in agree)}
+    answered = [l for l in lines if l.get("searxng", {}).get("ok") and l.get("compare")]
+    degraded = [l for l in answered if l["searxng"].get("degraded")]
+    ok = [l for l in answered if not l["searxng"].get("degraded")]
+    pairs = [(l["compare"].get("overlap_at_depth"), l["compare"]["n_both"]) for l in ok
+             if l["compare"].get("overlap_at_depth") is not None]
+    agree = [a for a, _ in pairs]
+    buckets = {"identical": sum(a == 1 for a, _ in pairs), "mostly the same": sum(0.5 <= a < 1 for a, _ in pairs),
+               "mostly different": sum(a < 0.5 and n > 0 for a, n in pairs),
+               "nothing shared": sum(n == 0 for _, n in pairs)}
     n_both = sum(l["compare"]["n_both"] for l in ok)
-    n_builtin = sum(len(l["builtin"]["results"]) for l in ok)
-    n_searx = sum(len(l["searxng"]["results"]) for l in ok)
+    n_builtin = sum(l["compare"].get("n_builtin", len(l["builtin"]["results"])) for l in ok)
+    n_searx = sum(l["compare"].get("n_searxng", len(l["searxng"]["results"])) for l in ok)
     fails = {}
     for l in lines:
         for e in l.get("searxng", {}).get("failed_engines") or []:
@@ -514,9 +529,11 @@ def experiment_report():
     pct = lambda a, b: f"{a} of {b} ({100 * a / b:.0f}%)" if b else f"{a} of {b}"
     out = [f"# SearXNG vs built-in search: experiment report ({time.strftime('%Y-%m-%d')})", "",
            f"searches logged: {len(lines)} ({span})",
-           f"SearXNG unavailable: {len(lines) - len(ok)}", "",
-           "How alike were the two lists? (agreement at depth k: share of the built-in search's k links",
-           "that are also in SearXNG's top k)"]
+           f"SearXNG unavailable: {len(lines) - len(answered)}",
+           f"SearXNG returned nothing (engines blocked or failed): {len(degraded)}",
+           "(both left out of the numbers below)", "",
+           "How alike were the two lists? Agreement at depth k: the share of the built-in search's k links",
+           "that are also in SearXNG's top k. \"Nothing shared\" means no link in common anywhere in the lists."]
     out += [f"  {k}: {v}" for k, v in buckets.items()]
     out += [f"  median agreement: {fmt(median(agree))}",
             f"  median RBO (p={RBO_P}): {fmt(median([l['compare']['rbo'] for l in ok if l['compare'].get('rbo') is not None]))}",
@@ -663,14 +680,28 @@ def main():
         print(f"# also in JSON: {', '.join(extra)}")
 
 
+def command(argv):
+    """The subcommand argv names, or None for a plain search. A command word followed by something that does not
+    fit the command ("compare postgres vs mysql", "server side rendering") is a search; `websearch -- ...` forces one."""
+    if len(argv) < 3:
+        return None
+    word, nxt = argv[1], argv[2]
+    helpish = nxt in ("-h", "--help")
+    if word == "scholar":
+        return scholar
+    if word == "server" and (nxt in ("status", "start", "stop", "update") or helpish):
+        return server
+    if word == "experiment" and (nxt in ("on", "off", "status", "report") or helpish):
+        return experiment
+    looks_like_file = "/" in nxt or nxt.endswith((".txt", ".json", ".jsonl", ".md")) or Path(nxt).is_file()
+    if word == "compare" and (nxt == "-" or helpish or looks_like_file):
+        return compare
+    return None
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "scholar":
-        scholar(sys.argv[2:])
-    elif len(sys.argv) > 1 and sys.argv[1] == "server":
-        server(sys.argv[2:])
-    elif len(sys.argv) > 1 and sys.argv[1] == "compare":
-        compare(sys.argv[2:])
-    elif len(sys.argv) > 1 and sys.argv[1] == "experiment":
-        experiment(sys.argv[2:])
+    cmd = command(sys.argv)
+    if cmd:
+        cmd(sys.argv[2:])
     else:
         main()

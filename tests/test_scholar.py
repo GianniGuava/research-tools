@@ -88,6 +88,26 @@ class Scholar(unittest.TestCase):
         self.assertIn("without a key", p.stderr)
         self.assertIsNone(s2.hits[0][1])
 
+    def test_key_with_a_second_line_is_not_used_and_not_shown(self):
+        self.write_key(FAKE_KEY + "\nnotes from the phone\n")
+        s2 = self.fake()
+        p = self.scholar(s2.url)
+        self.assertEqual(p.returncode, 0, "search without the key should still run")
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1)
+        self.assertIn("not used", p.stderr)
+        self.assertIsNone(s2.hits[0][1])
+        self.assertKeyNotShown(p)
+
+    def test_future_timestamp_does_not_stall(self):
+        self.write_key()
+        s2 = self.fake()
+        self.statefile.parent.mkdir(parents=True)
+        self.statefile.write_text(json.dumps({"day": "2000-01-01", "count": 0, "recent": [time.time() + 1000]}))
+        start = time.monotonic()
+        p = self.scholar(s2.url)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertLess(time.monotonic() - start, 5)
+
     def test_refused_key_error_does_not_show_key(self):
         self.write_key()
         s2 = self.fake(status=403, body={"message": f"Forbidden for key {FAKE_KEY}"})

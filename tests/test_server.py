@@ -44,6 +44,7 @@ class DownMessage(unittest.TestCase):
             self.assertEqual(len(lines), 1, p.stderr)
             self.assertIn("starting", lines[0])
             self.assertIn("built-in", lines[0])
+            self.assertIn("docker logs searxng", lines[0])
             pid = int(wait_for_file(pidfile))
             os.kill(pid, 0)  # raises if the start command was killed when the tool exited
         finally:
@@ -103,6 +104,34 @@ class StartsByItself(unittest.TestCase):
         finally:
             server.terminate()
             server.wait()
+
+
+class SubcommandWordsInQueries(unittest.TestCase):
+    """Review finding 4: queries that start with a command name still search."""
+
+    def setUp(self):
+        self.t = TempState()
+        port = free_port()
+        self.server = subprocess.Popen([sys.executable, str(FAKE), str(port)])
+        self.addCleanup(self.server.wait)
+        self.addCleanup(self.server.terminate)
+        self.url = f"http://127.0.0.1:{port}"
+        time.sleep(0.4)
+
+    def test_command_words_followed_by_search_terms_search(self):
+        for q in (["compare", "postgres", "vs", "mysql"], ["server", "side", "rendering"],
+                  ["experiment", "design", "notes"], ["scholar"]):
+            p = self.t.run(*q, SEARXNG_URL=self.url, WEBSEARCH_START_CMD="false")
+            self.assertEqual(p.returncode, 0, f"{q}: {p.stderr}")
+            self.assertIn("results from", p.stdout, q)
+
+    def test_real_commands_still_work(self):
+        f = self.t.path("a.txt")
+        f.write_text("https://example.org/\n")
+        p = self.t.run("compare", str(f), str(f))
+        self.assertIn("in both: 1", p.stdout)
+        p = self.t.run("experiment", "status", RT_EXPERIMENT_DIR=str(self.t.path("exp")))
+        self.assertIn("experiment on", p.stdout)
 
 
 class DefaultAddress(unittest.TestCase):
