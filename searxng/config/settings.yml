@@ -28,3 +28,13 @@ search:
 
 ui:
   static_use_hash: true
+
+# Off by default in this SearXNG version; switched on 2026-11-03 (Gianni, option A) because the three default
+# general engines (Brave, DuckDuckGo, Google CSE) blocked the server within about 40 searches.
+engines:
+  - name: bing
+    disabled: false
+  - name: google
+    disabled: false
+  - name: qwant
+    disabled: false
