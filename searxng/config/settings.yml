@@ -1,4 +1,5 @@
-# LAN-only SearXNG. Everything not listed here comes from SearXNG's defaults.
+# SearXNG on claude-dev, reachable from that machine only (docker-compose.yml publishes 127.0.0.1:8888).
+# Everything not listed here comes from SearXNG's defaults.
 # Reference: https://docs.searxng.org/admin/settings/settings_search.html (2026.10.30)
 use_default_settings: true
 
@@ -10,9 +11,9 @@ general:
 server:
   port: 8080
   bind_address: "0.0.0.0"
-  # Overridden by the SEARXNG_SECRET environment variable set in docker-compose.yml.
+  # Overridden by SEARXNG_SECRET from ~/.config/research-tools/searxng.env (see docker-compose.yml).
   secret_key: "replace-me"
-  # The limiter needs Valkey and exists to protect public instances. This one is LAN-only.
+  # The limiter needs Valkey and exists to protect public instances. Only this machine can reach this one.
   limiter: false
   public_instance: false
   image_proxy: false

@@ -1,5 +1,5 @@
 node_modules/
-searxng/.env
 searxng/data/
 *.png
 __pycache__/
+experiment/
