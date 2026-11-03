@@ -7,6 +7,7 @@ http://127.0.0.1:8888); if it is not answering, the tool starts it (waiting at m
 
     websearch server status|start|stop|update   manage the local SearXNG container
     websearch compare LIST_A LIST_B             which links two result lists share (or LIST_A --query Q)
+    websearch experiment on|off|status|report   the built-in vs SearXNG experiment (see bin/websearch-hook)
 
     websearch scholar <query>          academic search via the Semantic Scholar API
     websearch scholar --cited-by ID    papers citing ID (DOI:..., PMID:..., ARXIV:..., or an S2 id)
@@ -406,6 +407,8 @@ def compare_lists(a, b):
         "only_b": [fb[k] for k in kb if k not in sa],
         "overlap": len(sa & sb) / len(union) if union else None,
         "top10_shared": len(set(ka[:10]) & set(kb[:10])),
+        # agreement at depth k = len(first list): shared links among both top-k lists, divided by k (Webber et al. eq. 3)
+        "overlap_at_depth": len(set(ka) & set(kb[:len(ka)])) / len(ka) if ka else None,
         "rbo": rbo_ext(ka, kb) if union else None,
         "rbo_p": RBO_P,
     }
@@ -463,6 +466,88 @@ def compare(argv):
         print(f"## {title}")
         for i, u in enumerate(urls, 1):
             print(f"{i:2}. {u}")
+
+
+# The experiment (done check 7): bin/websearch-hook logs every built-in search next to a SearXNG search.
+EXPERIMENT_DIR = Path(os.environ.get("RT_EXPERIMENT_DIR") or REPO / "experiment")
+OUTBOX = Path("/mnt/code/_share/outbox/research-tools")
+
+
+def experiment_on():
+    """The switch lives in ~/.config/research-tools/experiment; no file means on (installing the hook opts in)."""
+    try:
+        return (config_dir() / "experiment").read_text().strip() != "off"
+    except FileNotFoundError:
+        return True
+
+
+def median(xs):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+
+
+def experiment_report():
+    """The report as text, built from the numbers each log line already holds."""
+    path = EXPERIMENT_DIR / "log.jsonl"
+    lines = []
+    if path.exists():
+        for raw in path.read_text().splitlines():
+            try:
+                lines.append(json.loads(raw))
+            except ValueError:
+                pass
+    ok = [l for l in lines if l.get("searxng", {}).get("ok") and l.get("compare")]
+    agree = [l["compare"]["overlap_at_depth"] for l in ok if l["compare"].get("overlap_at_depth") is not None]
+    buckets = {"identical": sum(a == 1 for a in agree), "mostly the same": sum(0.5 <= a < 1 for a in agree),
+               "mostly different": sum(0 < a < 0.5 for a in agree), "nothing shared": sum(a == 0 for a in agree)}
+    n_both = sum(l["compare"]["n_both"] for l in ok)
+    n_builtin = sum(len(l["builtin"]["results"]) for l in ok)
+    n_searx = sum(len(l["searxng"]["results"]) for l in ok)
+    fails = {}
+    for l in lines:
+        for e in l.get("searxng", {}).get("failed_engines") or []:
+            fails[e[0]] = fails.get(e[0], 0) + 1
+    span = f"{lines[0]['ts'][:10]} to {lines[-1]['ts'][:10]}, UTC" if lines else "none yet"
+    pct = lambda a, b: f"{a} of {b} ({100 * a / b:.0f}%)" if b else f"{a} of {b}"
+    out = [f"# SearXNG vs built-in search: experiment report ({time.strftime('%Y-%m-%d')})", "",
+           f"searches logged: {len(lines)} ({span})",
+           f"SearXNG unavailable: {len(lines) - len(ok)}", "",
+           "How alike were the two lists? (agreement at depth k: share of the built-in search's k links",
+           "that are also in SearXNG's top k)"]
+    out += [f"  {k}: {v}" for k, v in buckets.items()]
+    out += [f"  median agreement: {fmt(median(agree))}",
+            f"  median RBO (p={RBO_P}): {fmt(median([l['compare']['rbo'] for l in ok if l['compare'].get('rbo') is not None]))}",
+            "", f"built-in links SearXNG also found: {pct(n_both, n_builtin)}",
+            f"SearXNG links the built-in search also found: {pct(n_both, n_searx)}", "",
+            "engines that failed most often (searches affected):"]
+    out += [f"  {name}: {n}" for name, n in sorted(fails.items(), key=lambda x: -x[1])[:10]] or ["  none"]
+    return "\n".join(out) + "\n"
+
+
+def experiment(argv):
+    ap = argparse.ArgumentParser(prog="websearch experiment", description="The built-in vs SearXNG experiment.")
+    ap.add_argument("action", choices=["on", "off", "status", "report"])
+    ap.add_argument("--save", action="store_true", help="report: also save it to the outbox")
+    a = ap.parse_args(argv)
+    if a.action in ("on", "off"):
+        config_dir().mkdir(parents=True, exist_ok=True)
+        (config_dir() / "experiment").write_text(a.action + "\n")
+        print(f"experiment {a.action}")
+    elif a.action == "status":
+        log = EXPERIMENT_DIR / "log.jsonl"
+        n = len(log.read_text().splitlines()) if log.exists() else 0
+        print(f"experiment {'on' if experiment_on() else 'off'}; {n} searches logged in {log}")
+    else:
+        text = experiment_report()
+        print(text, end="")
+        if a.save:
+            OUTBOX.mkdir(parents=True, exist_ok=True)
+            out = OUTBOX / f"{time.strftime('%Y-%m-%d')}-experiment-report.md"
+            out.write_text(text)
+            print(f"saved to {out}")
 
 
 HUB_TAGS = "https://hub.docker.com/v2/repositories/searxng/searxng/tags?page_size=10&ordering=last_updated"
@@ -585,5 +670,7 @@ if __name__ == "__main__":
         server(sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "compare":
         compare(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "experiment":
+        experiment(sys.argv[2:])
     else:
         main()

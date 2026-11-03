@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Claude Code hook: repeat each built-in web search on SearXNG and log the comparison (the experiment).
+
+Runs after every WebSearch call (PostToolUse, in the background). For each search it
+  - appends one JSON line to experiment/log.jsonl: both result lists, timings, failed engines, comparison numbers
+  - writes experiment/searches/<date>-<time>-<id>.md with SearXNG's full list, for Claude to open when useful
+  - prints a one-line note for the session naming that file.
+`websearch experiment off` makes it exit at once and log nothing. Standard library only.
+"""
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import re
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+_loader = importlib.machinery.SourceFileLoader("websearch", str(Path(__file__).resolve().with_name("websearch")))
+ws = importlib.util.module_from_spec(importlib.util.spec_from_loader("websearch", _loader))
+_loader.exec_module(ws)
+
+SEARX_WAIT = 30  # seconds the hook waits for a stopped server to start; it runs in the background
+
+
+def builtin_links(resp):
+    """The built-in search's links, in order, and how they were found.
+
+    Shape seen in transcripts: {"query", "results": [{"tool_use_id", "content": [{"title", "url"}]}, "summary"],
+    "durationSeconds", "searchCount"}. Anything else falls back to the URLs in the text, marked "text".
+    """
+    links = []
+    if isinstance(resp, dict):
+        for block in resp.get("results") or []:
+            if isinstance(block, dict):
+                links += [{"title": c.get("title", ""), "url": c["url"]}
+                          for c in block.get("content") or [] if isinstance(c, dict) and c.get("url")]
+    if links:
+        return links, "structured"
+    text = resp if isinstance(resp, str) else json.dumps(resp)
+    urls = re.findall(r"https?://[^\s\"'<>\])]+", text)
+    return [{"title": "", "url": u.rstrip(".,;")} for u in dict.fromkeys(urls)], "text" if urls else "none"
+
+
+def in_domains(url, domains):
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return any(host == d.lower() or host.endswith("." + d.lower()) for d in domains)
+
+
+def short(text, n):
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[: n - 3] + "..."
+
+
+def write_search_file(path, entry):
+    q, s, c = entry["query"], entry["searxng"], entry["compare"]
+    out = [f"# SearXNG second search: {q}", "",
+           f"{entry['ts']}, session {entry['session_id']}. Built-in search: {len(entry['builtin']['results'])} links.", ""]
+    if not s["ok"]:
+        out += [f"SearXNG was unavailable: {s['reason']}"]
+    else:
+        out += [f"SearXNG: {len(s['results'])} links in {s['duration_s']}s."
+                + (f" Failed engines: {', '.join(f'{e[0]} ({e[1]})' for e in s['failed_engines'])}." if s["failed_engines"] else ""),
+                f"In both: {c['n_both']}, only built-in: {c['n_only_builtin']}, only SearXNG: {c['n_only_searxng']}; "
+                f"agreement {ws.fmt(c['overlap_at_depth'])}, RBO {ws.fmt(c['rbo'])}.", "", "## SearXNG results", ""]
+        shared = {ws.norm_url(u) for u in c["both"]}
+        for i, r in enumerate(s["results"], 1):
+            mark = " (also in built-in)" if ws.norm_url(r["url"]) in shared else ""
+            out += [f"{i}. {r['title']}{mark}", f"   {r['url']}", f"   [{', '.join(r['engines'])}]"]
+        out += ["", "## Only in the built-in search", ""] + [f"- {u}" for u in c["only_builtin"]]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out) + "\n")
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return
+    if data.get("tool_name") != "WebSearch" or not ws.experiment_on():
+        return
+    ti = data.get("tool_input") or {}
+    resp = data.get("tool_response")
+    query = ti.get("query") or (resp.get("query") if isinstance(resp, dict) else "") or ""
+    allowed, blocked = ti.get("allowed_domains") or [], ti.get("blocked_domains") or []
+    links, parse = builtin_links(resp)
+    now = time.gmtime()
+    uid = re.sub(r"\W", "", data.get("tool_use_id") or "")[-8:] or f"{time.time_ns() % 10**8}"
+    search_file = ws.EXPERIMENT_DIR / "searches" / f"{time.strftime('%Y-%m-%d-%H%M%S', now)}-{uid}.md"
+
+    searx = {"ok": False, "reason": None, "results": [], "n_before_domain_limit": 0, "duration_s": None,
+             "failed_engines": []}
+    started = time.monotonic()
+    try:
+        reply = ws.searx_search(ws.DEFAULT_URL, {"q": query, "format": "json", "categories": "general",
+                                                 "language": "en"}, timeout=30, deadline=started + SEARX_WAIT)
+        results = [{"title": r.get("title", ""), "url": r.get("url", ""), "engines": r.get("engines") or []}
+                   for r in reply.get("results", []) if r.get("url")]
+        searx["n_before_domain_limit"] = len(results)
+        if allowed:
+            results = [r for r in results if in_domains(r["url"], allowed)]
+        if blocked:
+            results = [r for r in results if not in_domains(r["url"], blocked)]
+        searx.update(ok=True, results=results, failed_engines=reply.get("unresponsive_engines") or [])
+    except ws.Unavailable as e:
+        searx["reason"] = str(e)
+    searx["duration_s"] = round(time.monotonic() - started, 2)
+
+    comp = None
+    if searx["ok"]:
+        c = ws.compare_lists([l["url"] for l in links], [r["url"] for r in searx["results"]])
+        comp = {"n_both": len(c["both"]), "n_only_builtin": len(c["only_a"]), "n_only_searxng": len(c["only_b"]),
+                "overlap": c["overlap"], "overlap_at_depth": c["overlap_at_depth"], "top10_shared": c["top10_shared"],
+                "rbo": c["rbo"], "rbo_p": c["rbo_p"],
+                "both": c["both"], "only_builtin": c["only_a"], "only_searxng": c["only_b"]}
+
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", now), "session_id": data.get("session_id"),
+        "tool_use_id": data.get("tool_use_id"), "query": query, "allowed_domains": allowed,
+        "blocked_domains": blocked, "mode": ti.get("mode"),
+        "builtin": {"results": links, "parse": parse,
+                    "duration_s": resp.get("durationSeconds") if isinstance(resp, dict) else None,
+                    "duration_ms_hook": data.get("duration_ms"),
+                    "response_keys": sorted(resp) if isinstance(resp, dict) else type(resp).__name__},
+        "searxng": searx, "compare": comp, "file": str(search_file),
+    }
+    write_search_file(search_file, entry)
+    log = ws.EXPERIMENT_DIR / "log.jsonl"
+    with open(log, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    q = short(query, 40)
+    if comp:
+        fails = ", ".join(e[0] for e in searx["failed_engines"][:3])
+        note = (f"SearXNG second search for '{q}': {comp['n_only_searxng']} links the built-in search did not return, "
+                f"{comp['n_both']} shared" + (f"; failed: {short(fails, 40)}" if fails else "") + f". List: {search_file}")
+    else:
+        note = f"SearXNG second search for '{q}' unavailable ({short(searx['reason'], 60)}); logged. {search_file}"
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": note}}))
+
+
+if __name__ == "__main__":
+    main()
