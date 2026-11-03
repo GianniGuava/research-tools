@@ -6,6 +6,7 @@ Skipped unless RT_LIVE=1, because they need the network and the running containe
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -84,9 +85,11 @@ class Check4StartsByItself(unittest.TestCase):
 
 @live
 class Check5Scholar(unittest.TestCase):
-    """Done check 5 with the real key: 10 searches in a row, no rate-limit refusals, spaced 1.1 s or more.
+    """Done check 5 with the real key: 10 searches in a row, none failing for rate limits, spaced 1.1 s or more.
 
-    Uses 12 of the day's 200 requests. The key is compared inside the test and never printed.
+    Read as "no search fails because of rate limits" (Gianni, 2 November 2026, option A): Semantic Scholar
+    refuses many requests whatever the spacing, and the tool retries them. Uses 12 or more of the day's
+    200 requests. The key is compared inside the test and never printed.
     """
 
     def test_ten_searches_in_a_row(self):
@@ -94,16 +97,17 @@ class Check5Scholar(unittest.TestCase):
         queries = ["rank biased overlap", "metasearch engine evaluation", "search result overlap",
                    "web search engine comparison", "query log analysis", "information retrieval evaluation",
                    "learning to rank", "search engine bias", "federated search", "result merging"]
-        outputs = [run("scholar", "-n", "3", q) for q in queries]
+        outputs = [run("scholar", "-n", "3", q, timeout=180) for q in queries]
+        refusals = [int(m.group(1)) if (m := re.search(r"refused (\d+)", p.stderr)) else 0 for p in outputs]
+        print(f"\n  check 5: refusals per search {refusals}", file=sys.stderr)
         for q, p in zip(queries, outputs):
             self.assertEqual(p.returncode, 0, f"{q}: {p.stderr.replace(key, '[key]')}")
-            self.assertNotIn("429", p.stderr)
             self.assertNotIn("without a key", p.stderr)
             self.assertFalse(key in p.stdout or key in p.stderr, "the key appeared in the output")
         state = json.loads((Path.home() / ".local" / "state" / "research-tools" / "s2_requests.json").read_text())
-        times = state["recent"][-10:]
+        times = state["recent"][-(10 + sum(refusals)):]
         gaps = [b - a for a, b in zip(times, times[1:])]
-        print(f"\n  check 5: 10 searches ok; smallest gap {min(gaps):.2f}s; {state['count']} requests today",
+        print(f"  check 5: 10 searches ok; smallest gap {min(gaps):.2f}s; {state['count']} requests today",
               file=sys.stderr)
         self.assertTrue(all(g >= 1.1 for g in gaps), gaps)
 

@@ -21,15 +21,18 @@ FAKE_KEY = "fake-key-0123456789abcdef0123456789abcdef"
 class FakeS2:
     """Records each request's arrival time and x-api-key header; answers with a set status and body."""
 
-    def __init__(self, status=200, body=None):
+    def __init__(self, status=200, body=None, refusals=0):
+        """Answers with `status`, except that the first `refusals` requests get a 429."""
         self.hits = []
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 fake.hits.append((time.time(), self.headers.get("x-api-key")))
-                data = json.dumps(body if body is not None else {"total": 0, "data": []}).encode()
-                self.send_response(status)
+                code = 429 if len(fake.hits) <= refusals else status
+                reply = {"message": "Too Many Requests"} if code == 429 else body
+                data = json.dumps(reply if reply is not None else {"total": 0, "data": []}).encode()
+                self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -63,7 +66,7 @@ class Scholar(unittest.TestCase):
         (self.keydir / "s2_api_key").write_text(text)
 
     def scholar(self, url, *args, timeout=60):
-        return self.t.run("scholar", *args, "test query", timeout=timeout, S2_API_URL=url)
+        return self.t.run("scholar", *args, "test query", timeout=timeout, S2_API_URL=url, S2_RETRY_BASE="0.1")
 
     def assertKeyNotShown(self, p):
         self.assertFalse(FAKE_KEY in p.stdout or FAKE_KEY in p.stderr, "the key appeared in the output")
@@ -134,16 +137,28 @@ class Scholar(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(json.loads(self.statefile.read_text())["count"], 1)
 
-    def test_rate_limit_retries_count_and_are_spaced(self):
+    def test_rate_limit_gives_up_after_five_retries_in_one_line(self):
         self.write_key()
-        s2 = self.fake(status=429, body={"message": "Too Many Requests"})
+        s2 = self.fake(refusals=99)
         p = self.scholar(s2.url, timeout=90)
         self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(len(s2.hits), 4)
-        self.assertEqual(json.loads(self.statefile.read_text())["count"], 4)
+        self.assertEqual(len(s2.hits), 6)
+        self.assertEqual(json.loads(self.statefile.read_text())["count"], 6)
         times = [t for t, _ in s2.hits]
         self.assertTrue(all(b - a >= 1.09 for a, b in zip(times, times[1:])))
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
         self.assertKeyNotShown(p)
+
+    def test_refused_then_answered_succeeds_with_one_summary_line(self):
+        self.write_key()
+        s2 = self.fake(refusals=2)
+        p = self.scholar(s2.url, timeout=90)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(s2.hits), 3)
+        lines = p.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, p.stderr)
+        self.assertIn("refused 2", lines[0])
+        self.assertIn("# Semantic Scholar", p.stdout)
 
 
 if __name__ == "__main__":
