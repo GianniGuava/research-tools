@@ -70,7 +70,7 @@ Installed 2026-11-02 following the SearXNG container docs (docs.searxng.org, "In
 - `searxng/config/settings.yml`: JSON output on (off by default, returns 403 otherwise); limiter off, because only this machine can reach the server and the limiter needs Valkey; `public_instance: false`; `image_proxy: false`; default language `en`; safe search off.
 - If the server is not answering, `websearch` runs `docker compose up -d` itself (under a lock, so two sessions do not race) and waits at most 5 seconds. A cold start that takes longer keeps going in the background, so the next search works.
 - The container's log shows `chown: /etc/searxng: Operation not permitted` at start: the settings folder is on the NAS, which does not allow the change. SearXNG reads it fine. The `ahmia` and `torch` engines fail to load because they need Tor; harmless.
-- Engines block servers that search too often. During the build DuckDuckGo answered with a CAPTCHA after about a dozen searches. `websearch` names such engines on every search, and the experiment report counts them.
+- Engines block servers that search too often. Only three engines give general web results by default (Brave, DuckDuckGo, Google CSE); during the build DuckDuckGo answered with a CAPTCHA after about a dozen searches and Brave suspended the server after about forty, leaving Google CSE alone. `websearch` names such engines on every search, and the experiment report counts them.
 
 To start from nothing on another Debian machine: `sudo apt-get install docker.io docker-compose`, `sudo usermod -aG docker $USER`, create the secret file with `SEARXNG_SECRET=` followed by `openssl rand -hex 32` (mode 600), then `websearch server start`.
 
@@ -98,7 +98,7 @@ How the lists are compared (`websearch compare` and the hook use the same code):
 
 - The key is read from `~/.config/research-tools/s2_api_key` (or `S2_API_KEY`), trimmed, and sent as `x-api-key`. It never appears in output, including error messages. Without it the tool says so in one line and searches without a key.
 - The key's terms allow 1 request per second, cumulative across all endpoints. The tool keeps every request at least 1.1 s after the previous one, across all sessions on the machine (a locked state file in `~/.local/state/research-tools/`), and stops at 200 requests per UTC day, the figure promised in the key application. Retries count toward both.
-- Semantic Scholar refuses many requests (HTTP 429) whatever the spacing: on 2026-11-02 and 03, about half to seven in ten keyed requests, and nine in ten without a key. The tool retries up to 5 times after 2, 4, 8, 16 and 16 s plus a random extra, and prints one summary line. Some searches still fail; treat it as a tool for deliberate academic lookups, with SearXNG's `-c science` as the first stop.
+- Semantic Scholar refuses many requests (HTTP 429) whatever the spacing: on 2026-11-02 and 03, about half to seven in ten keyed requests, and nine in ten without a key. The tool retries up to 5 times after 2, 4, 8, 16 and 16 s plus a random extra, and prints one summary line. Some searches still fail; treat it as a tool for deliberate academic lookups, with SearXNG's `-c science` (Semantic Scholar, Europe PMC, arXiv, PubMed and others) as the first stop. Leave out `-t` there: engines that cannot filter by date drop out, and on 2026-11-03 a dated science search returned nothing.
 - Terms: never share the key; credit "Semantic Scholar" in published material that uses its data; some data is CC BY-NC; keys unused for about 60 days may be removed.
 
 ## Tests
