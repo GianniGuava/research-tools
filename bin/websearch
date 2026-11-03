@@ -6,6 +6,7 @@ http://127.0.0.1:8888); if it is not answering, the tool starts it (waiting at m
 --public falls back to a public instance that allows JSON output.
 
     websearch server status|start|stop|update   manage the local SearXNG container
+    websearch compare LIST_A LIST_B             which links two result lists share (or LIST_A --query Q)
 
     websearch scholar <query>          academic search via the Semantic Scholar API
     websearch scholar --cited-by ID    papers citing ID (DOI:..., PMID:..., ARXIV:..., or an S2 id)
@@ -37,6 +38,10 @@ PUBLIC_URL = os.environ.get("SEARXNG_PUBLIC_URL", "https://searx.be")
 UA = "Mozilla/5.0 (X11; Linux x86_64) research-tools/websearch"
 
 
+class Unavailable(Exception):
+    """SearXNG could not answer; the message is one line ending with the fallback."""
+
+
 def search(base, params, timeout):
     url = base.rstrip("/") + "/search?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
@@ -46,14 +51,29 @@ def search(base, params, timeout):
         return json.loads(body), url
     except json.JSONDecodeError:
         head = body[:120].decode("utf-8", "replace").strip().replace("\n", " ")
-        raise SystemExit(f"websearch: {base} did not return JSON (got: {head!r}). "
-                         "Public instances usually disable the JSON API or sit behind a browser check; use the local instance.")
+        raise Unavailable(f"{base} did not return JSON (got: {head!r}). "
+                          "Public instances usually disable the JSON API or sit behind a browser check; use the local instance.")
 
 
 def failed_engines(data):
     """One line naming each engine that failed or blocked the server, with SearXNG's reason; '' when none did."""
     bad = [f"{e[0]} ({e[1]})" if len(e) > 1 and e[1] else str(e[0]) for e in data.get("unresponsive_engines") or []]
     return f"failed engines, results may be missing: {', '.join(bad)}" if bad else ""
+
+
+def searx_search(base, params, timeout=30, deadline=None):
+    """Search SearXNG, starting the local server first if needed. Raises Unavailable with a one-line reason."""
+    if is_local(base) and not healthy(base):
+        problem = ensure_server(base, T0 + START_WAIT if deadline is None else deadline)
+        if problem:
+            raise Unavailable(problem)
+    try:
+        return search(base, params, timeout)[0]
+    except urllib.error.HTTPError as e:
+        hint = " (json format not enabled on this instance?)" if e.code == 403 else ""
+        raise Unavailable(f"HTTP {e.code} from {base}{hint}; {FALLBACK}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise Unavailable(f"cannot reach {base}: {e}; {FALLBACK}")
 
 
 def state_dir():
@@ -307,6 +327,144 @@ def scholar(argv):
         print_paper(i, r, a.snippets)
 
 
+# Comparing result lists (done check 6).
+# Links are tidied first so trivial differences do not count: scheme, "www.", host case, default port,
+# trailing slash, "#" part, percent-encoding, parameter order, and tracking parameters.
+TRACKING = {"gclid", "dclid", "fbclid", "msclkid", "yclid", "mc_cid", "mc_eid", "igshid", "srsltid",
+            "_ga", "_gl", "_hsenc", "_hsmi", "mkt_tok"}
+RBO_P = 0.9  # Webber, Moffat and Zobel (2010) use 0.9 to compare search engines; the top 10 carry 86% of the weight
+
+
+def norm_url(url):
+    url = url.strip()
+    if "://" not in url:
+        url = "http://" + url
+    p = urllib.parse.urlsplit(url)
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    try:
+        port = p.port
+    except ValueError:
+        port = None
+    if port and port not in (80, 443):
+        host += f":{port}"
+    path = urllib.parse.unquote(p.path).rstrip("/")
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+             if not (k.lower().startswith("utm_") or k.lower() in TRACKING)]
+    q = urllib.parse.urlencode(sorted(query))
+    return host + path + ("?" + q if q else "")
+
+
+def rbo_ext(a, b, p=RBO_P):
+    """Extrapolated rank-biased overlap of two rankings without repeats (Webber, Moffat and Zobel,
+    "A Similarity Measure for Indefinite Rankings", ACM TOIS 28(4), 2010, equation 32; equation 23 when
+    the lengths are equal). 1 means the same order, 0 nothing shared."""
+    S, L = (a, b) if len(a) <= len(b) else (b, a)
+    s, l = len(S), len(L)
+    if s == 0:
+        return 0.0
+    seen_s, seen_l, X = set(), set(), [0] * (l + 1)
+    for d in range(1, l + 1):
+        x = X[d - 1]
+        item_l = L[d - 1]
+        if d <= s:
+            item_s = S[d - 1]
+            if item_s == item_l:
+                x += 1
+            else:
+                x += (item_s in seen_l) + (item_l in seen_s)
+            seen_s.add(item_s)
+        else:
+            x += item_l in seen_s
+        seen_l.add(item_l)
+        X[d] = x
+    total = sum(X[d] / d * p ** d for d in range(1, l + 1))
+    total += sum(X[s] * (d - s) / (s * d) * p ** d for d in range(s + 1, l + 1))
+    return (1 - p) / p * total + ((X[l] - X[s]) / l + X[s] / s) * p ** l
+
+
+def compare_lists(a, b):
+    """Compare two ranked lists of URLs. Returns the shared and unique links (as given in the
+    first list where shared) and the numbers: counts, overlap share, top-10 shared, and RBO."""
+    def tidy(urls):
+        keys, firsts = [], {}
+        for u in urls:
+            k = norm_url(u)
+            if k and k not in firsts:
+                firsts[k] = u
+                keys.append(k)
+        return keys, firsts
+    ka, fa = tidy(a)
+    kb, fb = tidy(b)
+    sa, sb = set(ka), set(kb)
+    union = sa | sb
+    return {
+        "n_a": len(ka), "n_b": len(kb),
+        "both": [fa[k] for k in ka if k in sb],
+        "only_a": [fa[k] for k in ka if k not in sb],
+        "only_b": [fb[k] for k in kb if k not in sa],
+        "overlap": len(sa & sb) / len(union) if union else None,
+        "top10_shared": len(set(ka[:10]) & set(kb[:10])),
+        "rbo": rbo_ext(ka, kb) if union else None,
+        "rbo_p": RBO_P,
+    }
+
+
+def read_url_list(path):
+    """URLs from a file (or - for stdin): one per line, SearXNG JSON, or a JSON list of strings or {url: ...}."""
+    text = sys.stdin.read() if path == "-" else Path(path).read_text()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    return [d if isinstance(d, str) else d.get("url", "") for d in data if d]
+
+
+def fmt(x):
+    return "n/a" if x is None else f"{x:.2f}"
+
+
+def compare(argv):
+    ap = argparse.ArgumentParser(prog="websearch compare", description="Which links two result lists share, "
+                                 "and which only one has. Lists: one URL per line, SearXNG JSON, or a JSON list.")
+    ap.add_argument("first", help="file with the first list (- for stdin)")
+    ap.add_argument("second", nargs="?", help="file with the second list")
+    ap.add_argument("--query", help="instead of a second file, search SearXNG for this now")
+    ap.add_argument("--labels", default=None, help="names for the two lists, e.g. built-in,searxng")
+    ap.add_argument("--json", action="store_true", help="print the comparison as JSON")
+    a = ap.parse_args(argv)
+    if bool(a.second) == bool(a.query):
+        ap.error("give a second file or --query, not both")
+    labels = (a.labels or ("first,searxng" if a.query else "first,second")).split(",", 1)
+    try:
+        first = read_url_list(a.first)
+        if a.query:
+            data = searx_search(DEFAULT_URL, {"q": a.query, "format": "json", "categories": "general", "language": "en"})
+            second = [r.get("url", "") for r in data.get("results", [])]
+        else:
+            second = read_url_list(a.second)
+    except OSError as e:
+        sys.exit(f"websearch: cannot read {e.filename}: {e.strerror}")
+    except Unavailable as e:
+        sys.exit(f"websearch: {e}")
+    c = compare_lists(first, second)
+    if a.json:
+        json.dump(dict(c, labels=labels), sys.stdout, indent=1, ensure_ascii=False)
+        print()
+        return
+    la, lb = labels
+    print(f"# {la} ({c['n_a']} links) vs {lb} ({c['n_b']} links)")
+    print(f"# in both: {len(c['both'])} | only {la}: {len(c['only_a'])} | only {lb}: {len(c['only_b'])} | "
+          f"overlap {fmt(c['overlap'])} | top-10 shared {c['top10_shared']} | RBO {fmt(c['rbo'])} (p={RBO_P})")
+    for title, urls in (("in both", c["both"]), (f"only in {la}", c["only_a"]), (f"only in {lb}", c["only_b"])):
+        print(f"## {title}")
+        for i, u in enumerate(urls, 1):
+            print(f"{i:2}. {u}")
+
+
 HUB_TAGS = "https://hub.docker.com/v2/repositories/searxng/searxng/tags?page_size=10&ordering=last_updated"
 
 
@@ -388,17 +546,10 @@ def main():
     if a.time_range:
         params["time_range"] = a.time_range
 
-    if not a.public and is_local(base) and not healthy(base):
-        problem = ensure_server(base, T0 + START_WAIT)
-        if problem:
-            sys.exit(f"websearch: {problem}")
     try:
-        data, url = search(base, params, a.timeout)
-    except urllib.error.HTTPError as e:
-        hint = " (json format not enabled on this instance?)" if e.code == 403 else ""
-        sys.exit(f"websearch: HTTP {e.code} from {base}{hint}; {FALLBACK}")
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        sys.exit(f"websearch: cannot reach {base}: {e}; {FALLBACK}")
+        data = searx_search(base, params, a.timeout)
+    except Unavailable as e:
+        sys.exit(f"websearch: {e}")
 
     failed = failed_engines(data)
     if a.json:
@@ -432,5 +583,7 @@ if __name__ == "__main__":
         scholar(sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "server":
         server(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "compare":
+        compare(sys.argv[2:])
     else:
         main()
