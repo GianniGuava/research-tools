@@ -31,10 +31,12 @@ ui:
 
 # Off by default in this SearXNG version; switched on 2026-11-03 (Gianni, option A) because the three default
 # general engines (Brave, DuckDuckGo, Google CSE) blocked the server within about 40 searches.
+# Google and Qwant switched off again 2026-11-06 (Gianni): they refused every search from the start
+# (Google "access denied", Qwant CAPTCHA, all 12 logged searches since then plus live checks on 2026-11-05).
 engines:
   - name: bing
     disabled: false
   - name: google
-    disabled: false
+    disabled: true
   - name: qwant
-    disabled: false
+    disabled: true
